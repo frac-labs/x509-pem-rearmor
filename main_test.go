@@ -93,12 +93,16 @@ func TestRearmorMultiCertSplitsOnComma(t *testing.T) {
 		}
 	}
 	// Leaf must be in part 0, chain in part 1 (order preserved).
+	// The 64-col wrapper inserts \n into the body, so strip newlines
+	// before comparing against the contiguous input.
 	dec0, _ := url.QueryUnescape(parts[0])
-	if !strings.Contains(dec0, leaf) {
+	flat0 := strings.ReplaceAll(dec0, "\n", "")
+	if !strings.Contains(flat0, leaf) {
 		t.Errorf("part 0 does not contain leaf body")
 	}
 	dec1, _ := url.QueryUnescape(parts[1])
-	if !strings.Contains(dec1, chain) {
+	flat1 := strings.ReplaceAll(dec1, "\n", "")
+	if !strings.Contains(flat1, chain) {
 		t.Errorf("part 1 does not contain chain body")
 	}
 }
