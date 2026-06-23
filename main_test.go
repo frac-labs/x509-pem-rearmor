@@ -44,19 +44,30 @@ func TestRearmorEmpty(t *testing.T) {
 	}
 }
 
-func TestRearmorWraps64Cols(t *testing.T) {
+// TestRearmorEmitsSingleLineBody verifies the v0.1.2 fix: the b64 body
+// between BEGIN/END armor must be a single line (no `\n` separators).
+// Empirical: Keycloak's SPI uses java.util.Base64.getDecoder() (BASIC,
+// whitespace-rejecting) on the armor-stripped body — 64-col-wrap with
+// embedded newlines triggered PemException at byte 574 (cdv#241).
+func TestRearmorEmitsSingleLineBody(t *testing.T) {
 	in := strings.Repeat("A", 200)
 	got, err := url.QueryUnescape(rearmor(in))
 	if err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	for _, line := range strings.Split(strings.TrimSpace(got), "\n") {
-		if line == "-----BEGIN CERTIFICATE-----" || line == "-----END CERTIFICATE-----" {
-			continue
-		}
-		if len(line) > 64 {
-			t.Errorf("line longer than 64 cols: %d", len(line))
-		}
+	// Trim trailing newline so split doesn't yield an empty final element.
+	lines := strings.Split(strings.TrimSpace(got), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("expected exactly 3 lines (BEGIN, body, END), got %d: %q", len(lines), lines)
+	}
+	if lines[0] != "-----BEGIN CERTIFICATE-----" {
+		t.Errorf("line 0 not BEGIN: %q", lines[0])
+	}
+	if lines[2] != "-----END CERTIFICATE-----" {
+		t.Errorf("line 2 not END: %q", lines[2])
+	}
+	if lines[1] != in {
+		t.Errorf("body line should be input verbatim (single line, no wrap), got %q", lines[1])
 	}
 }
 
