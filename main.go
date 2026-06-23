@@ -1,26 +1,29 @@
 // Package main is a reverse-proxy sidecar that rearmors Traefik's
-// passTLSClientCert "pem: true" middleware output (bare base64-DER, no armor,
-// comma-separated when multiple certs) as URL-encoded PEM with %0A line
-// breaks, comma-joined — the shape Keycloak's haproxy-provider X509 SPI
-// expects for X-Forwarded-Tls-Client-Cert.
+// passTLSClientCert "pem: true" middleware output as URL-encoded PEM with
+// a single-line base64 body, comma-joined when multiple certs — the shape
+// Keycloak's `nginx` provider X509 SPI accepts when its armor-stripped body
+// is fed to java.util.Base64.getDecoder() (BASIC, RFC 4648, whitespace-rejecting).
 //
 // See ADR-0012 (frac-labs/clawdiovascular) and references/traefik-keycloak-x509-spi-pem-decode.md.
 //
 // v0.1.1 (cdv#241): split input on `,` before armoring so leaf+chain are
-// emitted as two separate URL-encoded PEM blocks joined by `,`, instead of
-// wrapped together as one block (which produced invalid base64 in the body).
-// Also widened the pass-through guard to match either literal `BEGIN` or
-// URL-encoded `BEGIN%20` so already-armored input is never re-encoded.
+// emitted as two separate URL-encoded PEM blocks joined by `,`.
 //
-// v0.1.2 (cdv#241): emit b64 body as a SINGLE line (no 64-col wrap).
-// Empirical wire-capture (echo-debug Pod 2026-06-23T17:20Z) showed that
-// Keycloak's nginx-provider SPI URL-decodes correctly but then hands the
-// armor-stripped body to java.util.Base64.getDecoder() (BASIC decoder,
-// RFC 4648, whitespace-rejecting — NOT getMimeDecoder()). The v0.1.1
-// 64-col wrap embedded `\n` separators that survived URL-decode and
-// triggered PemException at byte 574. PEM-armor compatibility is NOT
-// Base64-decoder compatibility: armor + URL-encoding can both be
-// "correct" while the wrap convention inside still breaks decode.
+// v0.1.2 (cdv#241): emit b64 body as a SINGLE line (no 64-col wrap),
+// because KC's nginx SPI hands armor-stripped body to Java's basic Base64
+// decoder which rejects embedded whitespace.
+//
+// v0.1.3 (cdv#241): DROP the `BEGIN`/`BEGIN%20CERTIFICATE` pass-through
+// guards. Empirical (live KC keycloak-keycloakx-0 logs 2026-06-23T18:55Z):
+// Traefik's passTLSClientCert{pem:true} emits URL-encoded armored PEM
+// with 64-col-wrapped b64 body (separated by %0A). The v0.1.2 guard
+// matched `BEGIN%20CERTIFICATE` in that input and returned it unchanged,
+// so v0.1.2's single-line emit code never executed — 45 PemException
+// traces in 20min after the sidecar rolled. v0.1.3 unconditionally
+// normalizes any input shape (bare-base64-DER, literal armored PEM, or
+// URL-encoded armored PEM) to single-line-body URL-encoded armored PEM.
+// Idempotent on its own output.
+// Anti-pattern: `references/transformation-skipped-by-format-guard.md`.
 package main
 
 import (
@@ -39,26 +42,52 @@ const (
 	pemEnd     = "-----END CERTIFICATE-----"
 )
 
-// rearmorOne wraps a single bare base64-DER blob as URL-encoded PEM
-// (BEGIN/END armor, 64-col wrapped, then url.QueryEscape the whole thing).
-// If the input already contains a BEGIN marker (literal or %20-encoded),
-// it's returned unchanged.
+// stripWhitespace removes all ASCII whitespace from s.
+func stripWhitespace(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch r {
+		case ' ', '\t', '\n', '\r':
+			return -1
+		}
+		return r
+	}, s)
+}
+
+// rearmorOne unconditionally normalizes a single cert entry to a
+// URL-encoded single-line-body PEM block. Accepts bare base64-DER,
+// literal armored PEM (with or without 64-col wrap), URL-encoded
+// armored PEM (Traefik's actual output shape with `%20` for space and
+// `%0A` for newline, OR `+` for space — both valid URL-encodings), or
+// already-correct v0.1.3 output (idempotent).
+//
+// Strategy: if the input contains `%` URL-escape markers we decode with
+// url.QueryUnescape (handles both `+`→space and `%XX` percent-encoded
+// bytes — this is what KC's java.net.URLDecoder does). If there's no
+// `%` the input is a bare base64-DER blob (which never legitimately
+// contains `+` AND `%` — base64 alphabet has no `%`). We then strip
+// armor lines and whitespace from the body, and re-armor+encode.
 func rearmorOne(raw string) string {
 	if raw == "" {
 		return raw
 	}
-	if strings.Contains(raw, "BEGIN CERTIFICATE") || strings.Contains(raw, "BEGIN%20CERTIFICATE") {
-		return raw
+	s := raw
+	if strings.Contains(s, "%") {
+		if decoded, err := url.QueryUnescape(s); err == nil {
+			s = decoded
+		}
 	}
-	stripped := strings.ReplaceAll(strings.ReplaceAll(raw, "\n", ""), "\r", "")
-	stripped = strings.TrimSpace(stripped)
-	if stripped == "" {
+	// Strip armor lines (any number — defensive against doubled armor).
+	s = strings.ReplaceAll(s, pemBegin, "")
+	s = strings.ReplaceAll(s, pemEnd, "")
+	// Strip all whitespace (incl. the \n that separated 64-col chunks).
+	s = stripWhitespace(s)
+	if s == "" {
 		return raw
 	}
 	var buf bytes.Buffer
 	buf.WriteString(pemBegin)
 	buf.WriteString("\n")
-	buf.WriteString(stripped)
+	buf.WriteString(s)
 	buf.WriteString("\n")
 	buf.WriteString(pemEnd)
 	buf.WriteString("\n")
@@ -66,16 +95,10 @@ func rearmorOne(raw string) string {
 }
 
 // rearmor splits a Traefik passTLSClientCert pem:true header value on `,`
-// (one entry per cert in the chain — leaf first, then issuer(s)), rearmors
-// each entry independently, and rejoins with `,`. This matches the haproxy
-// SPI shape Keycloak expects: comma-separated URL-encoded PEM blocks.
+// (one entry per cert in the chain — leaf first, then issuer(s)),
+// rearmors each entry independently, and rejoins with `,`.
 func rearmor(raw string) string {
 	if raw == "" {
-		return raw
-	}
-	// If the whole value already contains armor (literal or URL-encoded),
-	// pass through — don't double-encode.
-	if strings.Contains(raw, "BEGIN CERTIFICATE") || strings.Contains(raw, "BEGIN%20CERTIFICATE") {
 		return raw
 	}
 	parts := strings.Split(raw, ",")
@@ -107,7 +130,7 @@ func main() {
 			r.Header.Set(headerName, rearmor(v))
 		}
 	}
-	log.Printf("x509-pem-rearmor v0.1.2 listening on %s, upstream %s", listen, upstreamURL)
+	log.Printf("x509-pem-rearmor v0.1.3 listening on %s, upstream %s", listen, upstreamURL)
 	if err := http.ListenAndServe(listen, proxy); err != nil {
 		log.Fatal(err)
 	}
