@@ -1,9 +1,16 @@
 // Package main is a reverse-proxy sidecar that rearmors Traefik's
-// passTLSClientCert "pem: true" middleware output (bare base64-DER, no armor)
-// as URL-encoded PEM with %0A line breaks, which is the shape Keycloak's
-// haproxy-provider X509 SPI expects for X-Forwarded-Tls-Client-Cert.
+// passTLSClientCert "pem: true" middleware output (bare base64-DER, no armor,
+// comma-separated when multiple certs) as URL-encoded PEM with %0A line
+// breaks, comma-joined — the shape Keycloak's haproxy-provider X509 SPI
+// expects for X-Forwarded-Tls-Client-Cert.
 //
 // See ADR-0012 (frac-labs/clawdiovascular) and references/traefik-keycloak-x509-spi-pem-decode.md.
+//
+// v0.1.1 (cdv#241): split input on `,` before armoring so leaf+chain are
+// emitted as two separate URL-encoded PEM blocks joined by `,`, instead of
+// wrapped together as one block (which produced invalid base64 in the body).
+// Also widened the pass-through guard to match either literal `BEGIN` or
+// URL-encoded `BEGIN%20` so already-armored input is never re-encoded.
 package main
 
 import (
@@ -22,20 +29,25 @@ const (
 	pemEnd     = "-----END CERTIFICATE-----"
 )
 
-// rearmor wraps a single base64-DER body with PEM armor + URL-encoded
-// newlines (%0A), the shape Keycloak's haproxy X509 SPI accepts.
-// If the value already contains a BEGIN marker, returns it unchanged.
-func rearmor(raw string) string {
-	if raw == "" || strings.Contains(raw, "BEGIN CERTIFICATE") {
+// rearmorOne wraps a single bare base64-DER blob as URL-encoded PEM
+// (BEGIN/END armor, 64-col wrapped, then url.QueryEscape the whole thing).
+// If the input already contains a BEGIN marker (literal or %20-encoded),
+// it's returned unchanged.
+func rearmorOne(raw string) string {
+	if raw == "" {
 		return raw
 	}
-	// Traefik may already chunk by 64 cols or emit a single line; either way,
-	// wrap as: BEGIN\n<base64 unchanged>\nEND with %0A separators URL-encoded.
+	if strings.Contains(raw, "BEGIN CERTIFICATE") || strings.Contains(raw, "BEGIN%20CERTIFICATE") {
+		return raw
+	}
+	stripped := strings.ReplaceAll(strings.ReplaceAll(raw, "\n", ""), "\r", "")
+	stripped = strings.TrimSpace(stripped)
+	if stripped == "" {
+		return raw
+	}
 	var buf bytes.Buffer
 	buf.WriteString(pemBegin)
 	buf.WriteString("\n")
-	// Re-wrap to 64 columns to be safe (haproxy provider tolerates wrap).
-	stripped := strings.ReplaceAll(strings.ReplaceAll(raw, "\n", ""), "\r", "")
 	for i := 0; i < len(stripped); i += 64 {
 		end := i + 64
 		if end > len(stripped) {
@@ -47,6 +59,27 @@ func rearmor(raw string) string {
 	buf.WriteString(pemEnd)
 	buf.WriteString("\n")
 	return url.QueryEscape(buf.String())
+}
+
+// rearmor splits a Traefik passTLSClientCert pem:true header value on `,`
+// (one entry per cert in the chain — leaf first, then issuer(s)), rearmors
+// each entry independently, and rejoins with `,`. This matches the haproxy
+// SPI shape Keycloak expects: comma-separated URL-encoded PEM blocks.
+func rearmor(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	// If the whole value already contains armor (literal or URL-encoded),
+	// pass through — don't double-encode.
+	if strings.Contains(raw, "BEGIN CERTIFICATE") || strings.Contains(raw, "BEGIN%20CERTIFICATE") {
+		return raw
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		out = append(out, rearmorOne(p))
+	}
+	return strings.Join(out, ",")
 }
 
 func main() {
@@ -70,7 +103,7 @@ func main() {
 			r.Header.Set(headerName, rearmor(v))
 		}
 	}
-	log.Printf("x509-pem-rearmor listening on %s, upstream %s", listen, upstreamURL)
+	log.Printf("x509-pem-rearmor v0.1.1 listening on %s, upstream %s", listen, upstreamURL)
 	if err := http.ListenAndServe(listen, proxy); err != nil {
 		log.Fatal(err)
 	}
