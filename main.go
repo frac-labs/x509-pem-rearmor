@@ -11,6 +11,16 @@
 // wrapped together as one block (which produced invalid base64 in the body).
 // Also widened the pass-through guard to match either literal `BEGIN` or
 // URL-encoded `BEGIN%20` so already-armored input is never re-encoded.
+//
+// v0.1.2 (cdv#241): emit b64 body as a SINGLE line (no 64-col wrap).
+// Empirical wire-capture (echo-debug Pod 2026-06-23T17:20Z) showed that
+// Keycloak's nginx-provider SPI URL-decodes correctly but then hands the
+// armor-stripped body to java.util.Base64.getDecoder() (BASIC decoder,
+// RFC 4648, whitespace-rejecting — NOT getMimeDecoder()). The v0.1.1
+// 64-col wrap embedded `\n` separators that survived URL-decode and
+// triggered PemException at byte 574. PEM-armor compatibility is NOT
+// Base64-decoder compatibility: armor + URL-encoding can both be
+// "correct" while the wrap convention inside still breaks decode.
 package main
 
 import (
@@ -48,14 +58,8 @@ func rearmorOne(raw string) string {
 	var buf bytes.Buffer
 	buf.WriteString(pemBegin)
 	buf.WriteString("\n")
-	for i := 0; i < len(stripped); i += 64 {
-		end := i + 64
-		if end > len(stripped) {
-			end = len(stripped)
-		}
-		buf.WriteString(stripped[i:end])
-		buf.WriteString("\n")
-	}
+	buf.WriteString(stripped)
+	buf.WriteString("\n")
 	buf.WriteString(pemEnd)
 	buf.WriteString("\n")
 	return url.QueryEscape(buf.String())
@@ -103,7 +107,7 @@ func main() {
 			r.Header.Set(headerName, rearmor(v))
 		}
 	}
-	log.Printf("x509-pem-rearmor v0.1.1 listening on %s, upstream %s", listen, upstreamURL)
+	log.Printf("x509-pem-rearmor v0.1.2 listening on %s, upstream %s", listen, upstreamURL)
 	if err := http.ListenAndServe(listen, proxy); err != nil {
 		log.Fatal(err)
 	}
